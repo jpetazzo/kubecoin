@@ -1,0 +1,166 @@
+#!/bin/sh
+
+# Set these two variables, otherwise nothing will work:
+#EMAIL=ada.lovelace@example.com
+#DOMAIN=kube.example.com
+
+set -u
+EMAIL=$EMAIL
+DOMAIN=$DOMAIN
+
+_namespace() {
+	NAMESPACE=$1
+	kubectl apply -f- <<EOF
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: $NAMESPACE
+EOF
+}
+
+_externalips() {
+	JSONPATH='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'
+	kubectl get nodes -o jsonpath=$JSONPATH | tr " " ","
+}
+
+do_1_localstorage() {
+    kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+    kubectl annotate storageclass local-path storageclass.kubernetes.io/is-default-class=true --overwrite
+}
+
+do_2_traefik_with_externalips() {
+	helm upgrade --install --namespace kube-system traefik traefik \
+		--repo https://helm.traefik.io/traefik \
+		--set "service.type=ClusterIP" \
+		--set "service.externalIPs={$(_externalips)}" \
+		--set "ports.websecure.tls.enabled=true" \
+		#
+}
+
+do_3_certmanager() {
+	kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v1.1.0/cert-manager.yaml	
+}
+
+do_4_issuers() {
+	sed s/hello@example.com/$EMAIL/ <<EOF | kubectl apply -f-
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    email: hello@example.com
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: issuer-letsencrypt-staging
+    solvers:
+    - http01:
+        ingress:
+          class: traefik
+EOF
+	sed s/hello@example.com/$EMAIL/ <<EOF | kubectl apply -f-
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-production
+spec:
+  acme:
+    email: hello@example.com
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: issuer-letsencrypt-production
+    solvers:
+    - http01:
+        ingress:
+          class: traefik
+EOF
+}
+
+
+do_5_gitlab() {
+	_namespace gitlab
+	helm upgrade --install --namespace gitlab gitlab gitlab \
+		--repo https://charts.gitlab.io/ \
+		--set global.hosts.domain=$DOMAIN \
+		--set certmanager.install=false \
+		--set nginx-ingress.enabled=false \
+		--set global.ingress.class=traefik \
+		--set global.ingress.provider=traefik \
+		--set global.ingress.configureCertmanager=false \
+		--set global.ingress.annotations."cert-manager\.io/cluster-issuer"=letsencrypt-production \
+		--set gitlab.webservice.ingress.tls.secretName=gitlab-gitlab-tls \
+		--set registry.ingress.tls.secretName=gitlab-registry-tls \
+		--set minio.ingress.tls.secretName=gitlab-minio-tls \
+		--set gitlab.gitlab-shell.service.externalIPs={$(_externalips)} \
+    --set global.shell.port=222 \
+    --set gitlab.webservice.replicaCount=2 \
+		#
+}
+
+do_6_showlogin() {
+    echo "GitLab URL: https://gitlab.$DOMAIN/"
+    echo "User: root"
+    echo "Password: $(kubectl get secrets --namespace=gitlab gitlab-gitlab-initial-root-password -o jsonpath={.data.password} | base64 -d)"
+}
+
+do_7_todo() {
+    cat <<EOF
+# Log as root on GitLab
+# Add your SSH key
+# Create a project
+# In project configuration, add KUBECONFIG file variable
+# Create a read-only registry access token
+# Add the registry access token and password in REGISTRY_USER / REGISTRY_PASSWORD
+# Push!
+EOF
+}
+
+_attachpvc() {
+	POD=$1
+	PVC=$(kubectl get pod $POD -o jsonpath={.spec.volumes[].persistentVolumeClaim.claimName})
+	kubectl apply -f- <<EOF
+kind: Pod
+apiVersion: v1
+metadata:
+  name: attachpvc
+spec:
+  volumes:
+  - name: pvc
+    persistentVolumeClaim:
+      claimName: $PVC
+  containers:
+  - name: sh
+    image: alpine
+    volumeMounts:
+    - name: pvc
+      mountPath: /pvc
+    stdin: true
+    tty: true
+EOF
+	kubectl wait --for condition=Ready pod/attachpvc
+	kubectl attach -ti attachpvc
+	kubectl delete pod attachpvc
+}
+
+_sshkeyscan() {
+    ssh-keyscan -p 222 gitlab.$DOMAIN >> ~/.ssh/known_hosts
+}
+
+echo "To view available commands, run:"
+echo ""
+echo "compgen -A function | grep ^do_"
+echo ""
+echo "If nothing shows up, remember: you shouldn't run this script, but source it."
+
+### Not used anymore
+
+# To fix permission errors:
+# - check which image is used in pod
+#   kubectl get pod gitlab-gitaly-0 -o jsonpath={.spec.containers[].image}
+# - pull the image
+# - inspect it; look for UID and GID
+# - or docker run $IMAGE id
+# then attachpvc and chown the pvc
+
+# To reconfigure sshd to listen on port 222 on the nodes:
+# ubuntu@node1:~$ for N in 2 3 4 5 6; do ssh node$N "echo Port 222 | sudo tee -a /etc/ssh/sshd_config; sudo systemctl restart sshd"; done

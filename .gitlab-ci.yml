@@ -1,0 +1,152 @@
+variables: {}
+
+stages:
+  - lint
+  - build
+  - deploy
+
+services: []
+  # Example: add a DinD container in the runner pods.
+  # (This requires to enable privileged pods in GitLab.)
+  #- docker:stable-dind
+
+
+# Useful documentation pages about variables:
+# https://docs.gitlab.com/ee/ci/variables/predefined_variables.html
+# https://docs.gitlab.com/12.10/ee/ci/variables/deprecated_variables.html
+show-env:
+  stage: lint
+  image: alpine
+  script:
+    - env | sort
+
+.build-base: &build-base
+  stage: build
+  before_script:
+    - mkdir -p $HOME/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"gitlab-ci-token\",\"password\":\"$CI_JOB_TOKEN\"}}}" > $HOME/.docker/config.json
+    - export CONTEXT=containers/${CONTAINER}
+    - export IMAGE=${CI_REGISTRY_IMAGE}/${CONTAINER}:${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}
+    - env | sort
+  except:
+    - production
+
+.build-with-buildkit: &builder
+  <<: *build-base
+  image: alpine
+  script:
+    - apk add curl
+    - curl -o /usr/local/bin/buildx -sSL https://github.com/docker/buildx/releases/download/v0.5.1/buildx-v0.5.1.linux-amd64
+    - chmod +x /usr/local/bin/buildx
+    - buildx create --driver=kubernetes --name=buildkit --use
+    - buildx build ${CONTEXT} --push -t ${IMAGE}
+
+# Note: using this requires to add "docker" in services.
+.build-with-docker:
+  <<: *build-base
+  image: docker:stable
+  script:
+    - docker build ${CONTEXT} -t ${IMAGE}
+    - docker push ${IMAGE}
+
+.build-with-kaniko:
+  <<: *build-base
+  image:
+    # Use the :debug image because it contains a shell and other tools.
+    name: gcr.io/kaniko-project/executor:debug
+    #entrypoint: [""]
+  script:
+    - executor --context ${CONTEXT} --destination ${IMAGE}
+
+build-rng:
+  <<: *builder
+  variables:
+    CONTAINER: rng
+
+build-webui:
+  <<: *builder
+  variables:
+    CONTAINER: webui
+
+build-hasher:
+  <<: *builder
+  variables:
+    CONTAINER: hasher
+
+build-worker:
+  <<: *builder
+  variables:
+    CONTAINER: worker
+
+lint-helm-chart:
+  stage: lint
+  image: dtzar/helm-kubectl:3.0.2
+  script:
+    - helm lint ./helm-chart
+
+.deploy-with-helm: &deploy-with-helm
+  image: dtzar/helm-kubectl:3.0.2
+  script:
+    - >-
+        kubectl get namespace ${NAMESPACE} || 
+        kubectl create namespace ${NAMESPACE}
+    - >-
+        kubectl label namespace --overwrite ${NAMESPACE} 
+        created-by=gitlab
+        phase=${PHASE}
+        project=${CI_PROJECT_NAME}
+        commit-short-sha=${CI_COMMIT_SHORT_SHA}
+    - >-
+        kubectl annotate namespace --overwrite ${NAMESPACE} 
+        commit-message="${CI_COMMIT_MESSAGE}"
+        job-url="${CI_JOB_URL}"
+    - >-
+        kubectl get secret regcreds --namespace ${NAMESPACE} ||
+        kubectl create secret --namespace ${NAMESPACE} docker-registry regcreds
+        --docker-server=${CI_REGISTRY}
+        --docker-username=${REGISTRY_USER}
+        --docker-password=${REGISTRY_PASSWORD}
+    - >-
+        helm upgrade --install ${CI_PROJECT_NAME} ./helm-chart
+        -n ${NAMESPACE}
+        -f ./values.yaml
+        --set global.tag=${CI_COMMIT_SHORT_SHA}
+        --set global.registry=${CI_REGISTRY_IMAGE}
+        --set ingress.host=${INGRESS_HOST}
+        --wait
+    - >-
+        kubectl label namespace --overwrite ${NAMESPACE}
+        qa=ok
+
+deploy-to-staging:
+  <<: *deploy-with-helm
+  stage: deploy
+  variables:
+    PHASE: staging
+    NAMESPACE: gl-${CI_PROJECT_PATH_SLUG}-${CI_COMMIT_SHORT_SHA}
+    INGRESS_HOST: ${CI_PROJECT_PATH_SLUG}-${CI_COMMIT_SHORT_SHA}-${CI_SERVER_HOST}
+  except:
+    - production
+
+deploy-to-production:
+  <<: *deploy-with-helm
+  stage: deploy
+  variables:
+    PHASE: production
+    NAMESPACE: ${CI_PROJECT_PATH_SLUG}
+    INGRESS_HOST: ${CI_PROJECT_PATH_SLUG}-${CI_SERVER_HOST}
+  before_script:
+    - >-
+        kubectl get namespace gl-${CI_PROJECT_PATH_SLUG}-${CI_COMMIT_SHORT_SHA}
+        -o jsonpath={.metadata.labels.qa} | grep -w ok
+  only:
+    - production
+
+cleanup:
+  <<: *deploy-with-helm
+  stage: .post
+  script:
+    - kubectl delete namespace ${NAMESPACE}
+  when: manual
+  except:
+    - production
