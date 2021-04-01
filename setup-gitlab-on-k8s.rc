@@ -7,6 +7,7 @@
 set -u
 EMAIL=$EMAIL
 DOMAIN=$DOMAIN
+set +u
 
 _namespace() {
 	NAMESPACE=$1
