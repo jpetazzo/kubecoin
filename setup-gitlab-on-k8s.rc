@@ -7,6 +7,7 @@
 set -u
 EMAIL=$EMAIL
 DOMAIN=$DOMAIN
+set +u
 
 _namespace() {
 	NAMESPACE=$1
@@ -92,8 +93,8 @@ do_5_gitlab() {
 		--set registry.ingress.tls.secretName=gitlab-registry-tls \
 		--set minio.ingress.tls.secretName=gitlab-minio-tls \
 		--set gitlab.gitlab-shell.service.externalIPs={$(_externalips)} \
-    --set global.shell.port=222 \
-    --set gitlab.webservice.replicaCount=2 \
+		--set global.shell.port=222 \
+		--set gitlab.webservice.replicaCount=2 \
 		#
 }
 
