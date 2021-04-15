@@ -9,16 +9,6 @@ EMAIL=$EMAIL
 DOMAIN=$DOMAIN
 set +u
 
-_namespace() {
-	NAMESPACE=$1
-	kubectl apply -f- <<EOF
-kind: Namespace
-apiVersion: v1
-metadata:
-  name: $NAMESPACE
-EOF
-}
-
 _externalips() {
 	JSONPATH='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'
 	kubectl get nodes -o jsonpath=$JSONPATH | tr " " ","
@@ -29,14 +19,27 @@ do_1_localstorage() {
     kubectl annotate storageclass local-path storageclass.kubernetes.io/is-default-class=true --overwrite
 }
 
-do_2_traefik_with_externalips() {
-	helm upgrade --install --namespace kube-system traefik traefik \
+do_2a_traefik_with_externalips() {
+	helm upgrade --install --create-namespace --namespace traefik traefik traefik \
 		--repo https://helm.traefik.io/traefik \
+		--set "ports.websecure.tls.enabled=true" \
 		--set "service.type=ClusterIP" \
 		--set "service.externalIPs={$(_externalips)}" \
-		--set "ports.websecure.tls.enabled=true" \
 		#
 }
+
+do_2b_traefik_with_loadbalancer() {
+	helm upgrade --install --create-namespace --namespace traefik traefik traefik \
+		--repo https://helm.traefik.io/traefik \
+		--set "ports.websecure.tls.enabled=true" \
+                --set "providers.kubernetesIngress.publishedService.enabled=true" \
+                --set "ports.ssh.port=2222" \
+                --set "ports.ssh.exposedPort=22" \
+                --set "ports.ssh.expose=true" \
+                --set "ports.ssh.protocol=TCP" \
+		#
+}
+
 
 do_3_certmanager() {
 	kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v1.1.0/cert-manager.yaml	
@@ -77,10 +80,8 @@ spec:
 EOF
 }
 
-
-do_5_gitlab() {
-	_namespace gitlab
-	helm upgrade --install --namespace gitlab gitlab gitlab \
+do_5a_gitlab_with_externalips() {
+	helm upgrade --install --create-namespace --namespace gitlab gitlab gitlab \
 		--repo https://charts.gitlab.io/ \
 		--set global.hosts.domain=$DOMAIN \
 		--set certmanager.install=false \
@@ -98,13 +99,48 @@ do_5_gitlab() {
 		#
 }
 
+do_5b_gitlab_with_loadbalancers() {
+	helm upgrade --install --create-namespace --namespace gitlab gitlab gitlab \
+		--repo https://charts.gitlab.io/ \
+		--set global.hosts.domain=$DOMAIN \
+		--set certmanager.install=false \
+		--set nginx-ingress.enabled=false \
+		--set global.ingress.class=traefik \
+		--set global.ingress.provider=traefik \
+		--set global.ingress.configureCertmanager=false \
+		--set global.ingress.annotations."cert-manager\.io/cluster-issuer"=letsencrypt-production \
+		--set gitlab.webservice.ingress.tls.secretName=gitlab-gitlab-tls \
+		--set registry.ingress.tls.secretName=gitlab-registry-tls \
+		--set minio.ingress.tls.secretName=gitlab-minio-tls \
+		--set gitlab.webservice.replicaCount=2 \
+		#
+}
+
 do_6_showlogin() {
     echo "GitLab URL: https://gitlab.$DOMAIN/"
     echo "User: root"
     echo "Password: $(kubectl get secrets --namespace=gitlab gitlab-gitlab-initial-root-password -o jsonpath={.data.password} | base64 -d)"
 }
 
-do_7_todo() {
+do_8_ingressroutetcp_for_gitshell_loadbalancer() {
+    kubectl apply -f- <<EOF
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: gitlab-shell
+  namespace: gitlab
+spec:
+  entryPoints:
+  - ssh
+  routes:
+  - match: HostSNI(\`*\`)
+    services:
+    - name: gitlab-gitlab-shell
+      port: 22
+EOF
+}
+
+do_8_todo() {
     cat <<EOF
 # Log as root on GitLab
 # Add your SSH key
